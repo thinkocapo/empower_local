@@ -1,0 +1,415 @@
+import React, { Component, useEffect } from 'react';
+import ReactDOM from 'react-dom';
+import './index.css';
+import 'react-loader-spinner/dist/loader/css/react-spinner-loader.css';
+import * as Sentry from '@sentry/react';
+import { createBrowserHistory } from 'history';
+import {
+  Routes,
+  Route,
+  BrowserRouter,
+  useLocation,
+  useNavigationType,
+  createRoutesFromChildren,
+  matchRoutes,
+} from 'react-router-dom';
+import { crasher } from './utils/errors';
+
+import { Provider } from 'react-redux';
+import { createStore, applyMiddleware, compose } from 'redux';
+import logger from 'redux-logger';
+import rootReducer from './reducers';
+
+import ScrollToTop from './components/ScrollToTop';
+import MemoryMetrics from './components/MemoryMetrics';
+import { startHeapSampling } from './utils/memoryMetrics';
+import Footer from './components/Footer';
+import Nav from './components/Nav';
+import About from './components/About';
+import Cart from './components/Cart';
+import CheckoutForm from './components/CheckoutForm';
+import Complete from './components/Complete';
+import CompleteError from './components/CompleteError';
+import Employee from './components/Employee';
+import Home from './components/Home';
+import NotFound from './components/NotFound';
+import Product from './components/Product';
+import Products from './components/Products';
+import ProductsJoin from './components/ProductsJoin';
+import Nplusone from './components/nplusone';
+
+// Attach trace headers only to same-origin requests and the local Flask backend.
+// (Upstream Empower Plant also lists its cloud hosts here; Empower Local is
+// local-only, so localhost + relative URLs is all that's needed.)
+const tracingOrigins = ['localhost', /^\//];
+
+const history = createBrowserHistory();
+
+// Empower Local ships with exactly one backend: the local Flask app.
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL_FLASK;
+const BACKEND_TYPE = 'flask';
+let FRONTEND_SLOWDOWN;
+let RAGECLICK;
+let PRODUCTS_API;
+let PRODUCTS_EXTREMELY_SLOW;
+let PRODUCTS_BE_ERROR;
+let ADD_TO_CART_JS_ERROR;
+let CHECKOUT_SUCCESS;
+let ERROR_BOUNDARY;
+const DSN = process.env.REACT_APP_DSN;
+const RELEASE = process.env.REACT_APP_RELEASE;
+const ENVIRONMENT = process.env.REACT_APP_ENVIRONMENT;
+// Spotlight mode: forward events to the local Spotlight sidecar instead of
+// (or in addition to) sentry.io. Works with no DSN. See README "Spotlight mode".
+const SPOTLIGHT = process.env.REACT_APP_SPOTLIGHT === 'true';
+
+console.log('ENVIRONMENT', ENVIRONMENT);
+console.log('RELEASE', RELEASE);
+console.log('SPOTLIGHT', SPOTLIGHT);
+
+Sentry.init({
+  dsn: DSN,
+  release: RELEASE,
+  environment: ENVIRONMENT,
+  tracesSampleRate: 1.0,
+  tracePropagationTargets: tracingOrigins,
+  propagateTraceparent: true, // Sentry <-> OTLP distributed tracing
+  profilesSampleRate: 1.0,
+  replaysSessionSampleRate: 1.0,
+  debug: true,
+  enableLogs: true,
+  enableMetrics: true, // required for Sentry.metrics.* -- see utils/memoryMetrics.js
+  beforeSendLog: (log) => {
+    const tags = Sentry.getIsolationScope().getScopeData().tags;
+    if ('user.email' in tags) {
+      log.attributes['user.email'] = tags['user.email'];
+    }
+    return log;
+  },
+  integrations: (defaultIntegrations) => [
+    // Filter out the Dedupe integration from the defaults
+    ...defaultIntegrations.filter(
+      (integration) => integration.name !== 'Dedupe'
+    ),
+    // Add custom integrations with options
+    Sentry.feedbackIntegration({
+      // Additional SDK configuration goes in here, for example:
+      colorScheme: 'system',
+    }),
+    Sentry.browserProfilingIntegration(),
+    Sentry.reactRouterV6BrowserTracingIntegration({
+      useEffect,
+      useLocation,
+      useNavigationType,
+      createRoutesFromChildren,
+      matchRoutes,
+    }),
+    Sentry.replayIntegration({
+      // Additional configuration goes in here
+      // replaysSessionSampleRate and replaysOnErrorSampleRate is now a top-level SDK option
+      blockAllMedia: false,
+      // https://docs.sentry.io/platforms/javascript/session-replay/configuration/#network-details
+      networkDetailAllowUrls: [/.*/],
+      unmask: ['.sentry-unmask'],
+    }),
+    Sentry.consoleLoggingIntegration(), // All console logs are sent to Sentry
+    Sentry.elementTimingIntegration(),
+    // Only added in Spotlight mode. Forwards every envelope to the local
+    // Spotlight sidecar (default http://localhost:8969/stream). No DSN required.
+    ...(SPOTLIGHT ? [Sentry.spotlightBrowserIntegration()] : []),
+  ],
+  beforeSend(event, hint) {
+    // Parse from tags because src/index.js already set it there. Once there are React route changes, it is no longer in the URL bar
+    let se;
+    Sentry.withScope(function (scope) {
+      se = scope._tags.se;
+    });
+
+    let is5xxError =
+      event.exception && /^5\d{2} - .*$/.test(event.exception.values[0].value);
+    if (se && is5xxError) {
+      // Create a separate issue for each SE and RELEASE combination
+      const seTdaPrefixRegex = /[^-]+-tda-[^-]+-/;
+      let seFingerprint = se;
+      let prefix = seTdaPrefixRegex.exec(se);
+      if (prefix) {
+        // Now that TDA puts platform/browser and test path into SE tag we want to prevent
+        // creating separate issues for those. See https://github.com/sentry-demos/empower/pull/332
+        seFingerprint = prefix[0];
+      }
+      if (se.startsWith('prod-tda-')) {
+        // Release Health
+        event.fingerprint = ['{{ default }}', seFingerprint, RELEASE];
+      } else {
+        // SE Testing
+        event.fingerprint = ['{{ default }}', seFingerprint];
+      }
+    } else {
+      event.fingerprint = ['{{ default }}'];
+    }
+
+    if (is5xxError) {
+      // don't group different backends into the same issue to avoid mismatch between Seer autofix and latest event.
+      event.fingerprint.push(BACKEND_TYPE);
+    }
+
+    if (event.exception) {
+      sessionStorage.setItem('lastErrorEventId', event.event_id);
+    }
+
+    return event;
+  },
+});
+
+// Baseline heap reading + start the periodic sampler. Right after Sentry.init so
+// the app-load sample reflects the heap before any route has rendered.
+startHeapSampling();
+
+const SentryRoutes = Sentry.withSentryReactRouterV6Routing(Routes);
+
+const sentryReduxEnhancer = Sentry.createReduxEnhancer({});
+
+const store = createStore(
+  rootReducer,
+  compose(applyMiddleware(logger), sentryReduxEnhancer)
+);
+
+class App extends Component {
+  constructor() {
+    super();
+    this.state = {
+      cart: {
+        items: [],
+        quantities: {},
+        total: 0,
+      },
+      products: {
+        response: [],
+      },
+    };
+
+    let queryParams = new URLSearchParams(history.location.search);
+
+    console.log(`> backendUrl: ${BACKEND_URL}`);
+
+    // These also get passed via request headers (see window.fetch below)
+
+    // NOTE: because the demo extracts tags from the scope in order to pass them
+    // as headers to the backend, we need to make sure we are calling `setTag()`
+    // on the current scope. We don't want to call Sentry.setTag() as is usually
+    // recommended (https://docs.sentry.io/platforms/javascript/enriching-events/scopes/#isolation-scope),
+    // because that would set the tag on the isolation scope, and make it inaccessible
+    // when it's time to set the headers.
+    let currentScope = Sentry.getCurrentScope();
+
+    const customerType = [
+      'medium-plan',
+      'large-plan',
+      'small-plan',
+      'enterprise',
+    ][Math.floor(Math.random() * 4)];
+    currentScope.setTag('customerType', customerType);
+
+    let se = queryParams.get('se');
+    if (se) {
+      // Route components (navigation changes) will now have 'se' tag on scope
+      currentScope.setTag('se', se);
+      // for use in CheckoutForm.js when deciding whether to pre-fill form
+      // lasts for as long as the tab is open
+      sessionStorage.setItem('se', se);
+    }
+
+    // see `cexp` fixture in _tda/conftest.py
+    let cexp = queryParams.get('cexp');
+    if (cexp) {
+      currentScope.setTag('cexp', cexp);
+
+      if (cexp === 'products_extremely_slow') {
+        PRODUCTS_EXTREMELY_SLOW = true;
+      } else if (cexp === 'products_be_error') {
+        PRODUCTS_BE_ERROR = true;
+      } else if (cexp === 'add_to_cart_js_error') {
+        ADD_TO_CART_JS_ERROR = true;
+      } else if (cexp === 'checkout_success') {
+        CHECKOUT_SUCCESS = true;
+      }
+    }
+
+    if (queryParams.get('frontendSlowdown') === 'true') {
+      console.log('> frontend-only slowdown: true');
+      FRONTEND_SLOWDOWN = true;
+      currentScope.setTag('frontendSlowdown', true);
+    } else {
+      console.log('> frontend + backend slowdown');
+      currentScope.setTag('frontendSlowdown', false);
+    }
+
+    if (queryParams.get('api') === 'join') {
+      if (PRODUCTS_EXTREMELY_SLOW || PRODUCTS_BE_ERROR || FRONTEND_SLOWDOWN) {
+        throw new Error(
+          "?products_api=join can't be combined with ?cexp=products_extremely_slow, ?cexp=products_be_error, or ?frontendSlowdown=true"
+        );
+      }
+      PRODUCTS_API = 'products-join';
+      currentScope.setTag('api', 'products-join');
+    } else {
+      PRODUCTS_API = 'products';
+      currentScope.setTag('api', 'products');
+    }
+
+    if (queryParams.get('rageclick') === 'true') {
+      RAGECLICK = true;
+    }
+
+    if (queryParams.get('userFeedback')) {
+      sessionStorage.setItem('userFeedback', queryParams.get('userFeedback'));
+    } else {
+      sessionStorage.setItem('userFeedback', 'false');
+    }
+    sessionStorage.removeItem('lastErrorEventId');
+
+    currentScope.setTag('backendType', BACKEND_TYPE);
+
+    const metricScopeAttrs = { backendType: BACKEND_TYPE };
+    if (cexp) {
+      metricScopeAttrs.cexp = cexp;
+    }
+    Sentry.getGlobalScope().setAttributes(metricScopeAttrs);
+
+    let email = null;
+    if (queryParams.get('userEmail')) {
+      email = queryParams.get('userEmail');
+    } else if (se && !se.startsWith('prod-tda-')) {
+      email = se + '@example.com';
+    } else {
+      const letters = 'abcdefghijklmnopqrstuvwxyz';
+      email =
+        Array(3)
+          .fill()
+          .map(() => letters[Math.floor(Math.random() * letters.length)])
+          .join('') + '@example.com';
+    }
+    currentScope.setUser({ email: email });
+
+    let errorBoundary = queryParams.get('error_boundary');
+    if (errorBoundary) {
+      ERROR_BOUNDARY = errorBoundary;
+      currentScope.setTag('error_boundary', errorBoundary);
+    }
+
+    // Automatically append `se`, `customerType` and `userEmail` query params to all requests
+    // (except for requests to Sentry)
+    const nativeFetch = window.fetch;
+    window.fetch = async function (...args) {
+      let url = args[0];
+      // When TDA is run in 'mock' mode inside Docker mini-relay will be ingesting on port 9989, see:
+      // https://github.com/sentry-demos/empower/blob/79bed0b78fb3d40dff30411ef26c31dc7d4838dc/mini-relay/Dockerfile#L9
+      let ignore_match = url.match(
+        /^http[s]:\/\/([^.]+\.ingest\.sentry\.io\/|localhost:9989|127.0.0.1:9989).*/
+      );
+      if (!ignore_match) {
+        Sentry.withScope(function (scope) {
+          let se, customerType, email, cexp;
+          [se, customerType, email, cexp] = [
+            scope._tags.se,
+            scope._tags.customerType,
+            scope._user.email,
+            scope._tags.cexp,
+          ];
+          args[1].headers = {
+            ...args[1].headers,
+            se,
+            customerType,
+            email,
+            cexp,
+          };
+        });
+      }
+      let res = nativeFetch.apply(window, args);
+      if (args[0].includes('/apply-promo-code')) {
+        await new Promise((resolve) => setTimeout(resolve, 1500)); // to avoid log lines reordering due to clock drift between FE/BE
+      }
+      return res;
+    };
+
+    // Crasher parses query params sent by /tests for triggering crashes for Release Health
+    crasher();
+  }
+
+  render() {
+    return (
+      <Provider store={store}>
+        <BrowserRouter history={history}>
+          <ScrollToTop />
+          <MemoryMetrics />
+          <Nav frontendSlowdown={FRONTEND_SLOWDOWN} />
+          <div id="body-container">
+            <SentryRoutes>
+              <Route
+                path="/"
+                element={
+                  <Home
+                    backend={BACKEND_URL}
+                    frontendSlowdown={FRONTEND_SLOWDOWN}
+                  />
+                }
+              ></Route>
+              <Route
+                path="/about"
+                element={<About backend={BACKEND_URL} history={history} />}
+              ></Route>
+              <Route path="/cart" element={<Cart />} />
+              <Route
+                path="/checkout-form"
+                element={
+                  <CheckoutForm
+                    backend={BACKEND_URL}
+                    rageclick={RAGECLICK}
+                    checkout_success={CHECKOUT_SUCCESS}
+                    history={history}
+                  />
+                }
+              ></Route>
+              <Route path="/complete" element={<Complete />} />
+              <Route path="/error" element={<CompleteError />} />
+              <Route path="/employee/:id" element={<Employee />}></Route>
+              <Route path="/product/:id" element={<Product />}></Route>
+              <Route
+                path="/products"
+                element={
+                  <Products
+                    backend={BACKEND_URL}
+                    frontendSlowdown={false}
+                    productsApi={PRODUCTS_API}
+                    productsExtremelySlow={PRODUCTS_EXTREMELY_SLOW}
+                    productsBeError={PRODUCTS_BE_ERROR}
+                    addToCartJsError={ADD_TO_CART_JS_ERROR}
+                  />
+                }
+              ></Route>
+              <Route
+                path="/products-fes" // fes = frontend slowdown (only frontend)
+                element={
+                  <Products backend={BACKEND_URL} frontendSlowdown={true} />
+                }
+              ></Route>
+              <Route
+                path="/nplusone"
+                element={<Nplusone backend={BACKEND_URL} />}
+              />
+              <Route
+                path="/products-join"
+                element={<ProductsJoin backend={BACKEND_URL} />}
+              ></Route>
+              <Route path="*" element={<NotFound />} />
+            </SentryRoutes>
+          </div>
+          <Footer backend={BACKEND_URL} errorBoundary={ERROR_BOUNDARY} />
+        </BrowserRouter>
+      </Provider>
+    );
+  }
+}
+
+// React-router in use here https://reactrouter.com/web/guides/quick-start
+ReactDOM.render(<App />, document.getElementById('root'));

@@ -1,0 +1,35 @@
+# Empower Local — React frontend + Flask backend, no external dependencies.
+#
+# Values are read from a local `.env` file (copy `.env.template` -> `.env`).
+# The ONLY thing you must fill in is your two Sentry DSNs.
+
+services:
+  flask:
+    build: ./flask
+    ports:
+      - "8080:8080"
+    environment:
+      # Flask reads these at runtime.
+      FLASK_DSN: ${FLASK_DSN}
+      FLASK_ENVIRONMENT: ${FLASK_ENVIRONMENT:-local}
+      FLASK_RELEASE: ${FLASK_RELEASE:-empower-local-flask@1.0.0}
+      RUN_SLOW_PROFILE: ${RUN_SLOW_PROFILE:-true}
+
+  react:
+    build:
+      context: ./react
+      # create-react-app bakes REACT_APP_* into the bundle at BUILD time, so
+      # these are build args, not runtime env. The SENTRY_* trio is optional and
+      # only enables source-map upload when set.
+      args:
+        REACT_APP_DSN: ${REACT_APP_DSN}
+        REACT_APP_RELEASE: ${REACT_APP_RELEASE:-empower-local-react@1.0.0}
+        REACT_APP_ENVIRONMENT: ${REACT_APP_ENVIRONMENT:-local}
+        REACT_APP_BACKEND_URL_FLASK: ${REACT_APP_BACKEND_URL_FLASK:-http://localhost:8080}
+        SENTRY_AUTH_TOKEN: ${SENTRY_AUTH_TOKEN:-}
+        SENTRY_ORG: ${SENTRY_ORG:-}
+        REACT_SENTRY_PROJECT: ${REACT_SENTRY_PROJECT:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - flask

@@ -1,0 +1,35 @@
+# Spotlight mode overlay for Empower Local.
+#
+# Layer this on top of the base compose file to run WITHOUT a sentry.io account.
+# Events/traces flow into a local Spotlight sidecar instead; open the Spotlight
+# UI at http://localhost:8969.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.spotlight.yaml up --build
+#
+# No DSNs required — leave REACT_APP_DSN / FLASK_DSN blank in .env.
+
+services:
+  # The Spotlight sidecar: receives envelopes at :8969/stream and serves the
+  # debug UI at :8969.
+  spotlight:
+    image: ghcr.io/getsentry/spotlight:latest
+    ports:
+      - "8969:8969"
+
+  flask:
+    # The Python SDK auto-detects this env var and forwards envelopes to the
+    # sidecar (reachable by its compose service name from inside the network).
+    environment:
+      SENTRY_SPOTLIGHT: http://spotlight:8969/stream
+    depends_on:
+      - spotlight
+
+  react:
+    build:
+      args:
+        # Adds spotlightBrowserIntegration() in src/index.js. The browser sends
+        # to the sidecar at its default http://localhost:8969/stream (host port).
+        REACT_APP_SPOTLIGHT: "true"
+    depends_on:
+      - spotlight
+      - flask

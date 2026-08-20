@@ -1,0 +1,17 @@
+# Secrets / local config
+.env
+
+# Node
+node_modules/
+react/build/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+flask/venv/
+.venv/
+
+# OS / editor
+.DS_Store
+*.swp
