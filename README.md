@@ -26,6 +26,10 @@ employee-only Google Cloud access. Empower Local trades all that away:
 
 ---
 
+> **Just want to click around, no install?** Try the hosted, log-in-and-go
+> sandbox at **https://sandbox.sentry.io/** — no SDK to set up. Come back here
+> when you want to run and instrument the app yourself.
+
 ## Setup (one time)
 
 **1. Install Docker.** You need Docker Desktop (macOS/Windows) or Docker Engine +
